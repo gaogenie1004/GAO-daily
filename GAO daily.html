@@ -52,7 +52,9 @@ const QUERIES = ["stock market","Wall Street stocks","S&P 500 Nasdaq Dow","stock
 
 const PROXIES = [
   u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
-  u => "https://corsproxy.io/?" + encodeURIComponent(u)
+  u => "https://corsproxy.io/?" + encodeURIComponent(u),
+  u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+  u => "https://thingproxy.freeboard.io/fetch/" + u
 ];
 
 const BULL = ["rally","surge","soar","jump","gain","record high","beat","beats","upgrade","rate cut","cuts rates","easing","stimulus","deal","truce","ceasefire","rebound","optimism","strong earnings","boost","climb","rise","rises"];
@@ -91,7 +93,7 @@ async function getXml(url){
   return null;
 }
 
-async function collect(qs, ko){
+async function collectRss(qs, ko){
   const cutoff = Date.now() - HOURS*3600*1000;
   const seen = new Set(), arts = [];
   let done = 0;
@@ -115,6 +117,53 @@ async function collect(qs, ko){
   }));
   arts.sort((a,b)=>b.pub-a.pub);
   return arts.slice(0,MAX_ARTICLES);
+}
+
+// ---------- GDELT (프록시 없이 직접 호출) ----------
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+async function collectGdelt(gq){
+  const seen = new Set(), arts = [];
+  for(let i=0;i<gq.length;i++){
+    log(`뉴스 수집 ${i+1}/${gq.length}`);
+    try{
+      const url = "https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent(gq[i])
+        +"&mode=artlist&maxrecords=250&format=json&sort=datedesc&timespan="+HOURS+"h";
+      const r = await fetch(url);
+      const t = await r.text();
+      let j = null; try{ j = JSON.parse(t); }catch(e){}
+      (j && j.articles || []).forEach(a=>{
+        const m = (a.seendate||"").match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+        const pub = m ? Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6]) : Date.now();
+        const title = (a.title||"").replace(/\s+/g," ").trim();
+        const key = title.toLowerCase().replace(/[^a-z0-9가-힣]/g,"").slice(0,80);
+        if(!key || seen.has(key)) return;
+        seen.add(key);
+        arts.push({title, source: a.domain||"unknown", pub});
+      });
+    }catch(e){ log("  (이번 검색 실패, 다음으로)"); }
+    if(i<gq.length-1) await sleep(5500);
+  }
+  arts.sort((a,b)=>b.pub-a.pub);
+  return arts.slice(0,MAX_ARTICLES);
+}
+
+async function collect(qs, ko, focus){
+  let gq;
+  if(focus){
+    gq = ko ? [`"${focus}" sourcelang:korean`, `"${focus}" 주가 sourcelang:korean`]
+            : [`"${focus}" sourcelang:english`, `"${focus}" (stock OR shares) sourcelang:english`];
+  } else {
+    gq = ['"stock market" sourcelang:english',
+          '(stocks OR shares) (rally OR surge OR record) sourcelang:english',
+          '(stocks OR shares) (plunge OR selloff OR slump) sourcelang:english',
+          '(Fed OR inflation OR tariffs OR earnings) (markets OR stocks) sourcelang:english'];
+  }
+  let arts = await collectGdelt(gq);
+  if(!arts.length){
+    log("다른 경로로 재시도 중...");
+    arts = await collectRss(qs, ko);
+  }
+  return arts;
 }
 
 // ---------- Claude 방식 ----------
@@ -185,6 +234,20 @@ function rank(items, arts){
   return out.sort((a,b)=>b.score-a.score).slice(0,TOP_N);
 }
 
+async function toKo(text){
+  if(/[가-힣]/.test(text)) return text;
+  try{
+    const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t&q="+encodeURIComponent(text);
+    const r = await fetch(url);
+    const j = await r.json();
+    const out = (j[0]||[]).map(x=>x[0]).join("").trim();
+    return out || text;
+  }catch(e){ return text; }
+}
+async function translateAll(list){
+  await Promise.all(list.map(async r=>{ r.issue = await toKo(r.issue); }));
+}
+
 function section(title, list){
   let s = title+"\n";
   for(let n=0;n<TOP_N;n++){
@@ -221,9 +284,9 @@ $("go").onclick = async ()=>{
       if(!focus) throw new Error("종목/키워드를 입력하거나 market을 선택해주세요.");
       const ko = /[가-힣]/.test(focus);
       const qs = ko ? [focus, focus+" 주가", focus+" 실적"] : [focus, focus+" stock", focus+" shares", focus+" earnings"];
-      arts = await collect(qs, ko);
+      arts = await collect(qs, ko, focus);
     } else {
-      arts = await collect(QUERIES, false);
+      arts = await collect(QUERIES, false, "");
     }
     log(`기사 ${arts.length}건 수집`);
     if(!arts.length) throw new Error("뉴스를 가져오지 못했어요. 잠시 후 다시 시도해주세요.");
@@ -233,6 +296,8 @@ $("go").onclick = async ()=>{
     else { log("키워드 방식으로 분류 중..."); res = analyzeKeyword(arts); }
 
     const bull = rank(res.bullish||[],arts), bear = rank(res.bearish||[],arts);
+    log("한글로 번역 중...");
+    await translateAll([...bull, ...bear]);
     const now = new Date().toLocaleString("ko-KR");
     const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus?`[${focus}]\n`:""}(${now} 기준 최근 ${HOURS}시간)\n\n`
               + section(focus?`ㅡ${focus} 호재`:"ㅡ증시 호재",bull) + "\n" + section(focus?`ㅡ${focus} 악재`:"ㅡ증시 악재",bear);
