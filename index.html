@@ -26,14 +26,15 @@ pre{white-space:pre-wrap;background:#1b1b1b;padding:12px;border-radius:8px;font-
 <input id="tok" type="password" placeholder="123456789:AAH...">
 <label>텔레그램 채팅 ID</label>
 <input id="chat" type="text" inputmode="numeric" placeholder="54529109">
-
-<label>Anthropic API 키 (선택 · 넣으면 한국어 요약/정확도 ↑, 비우면 키워드 방식)</label>
+<label>Anthropic API 키 (한글 요약·키워드 정리에 필요)</label>
 <input id="key" type="password" placeholder="sk-ant-...">
+<label>YouTube API 키 (선택 · 넣으면 영상 조회수 반영)</label>
+<input id="yt" type="password" placeholder="AIza...">
 
-<label>분석 대상 선택 (market = 전체 증시 / 오른쪽 = 종목·키워드)</label>
+<label>분석 대상 (market = 전체 증시 / 오른쪽 = 종목·키워드)</label>
 <div id="modes">
   <div id="mk" class="box on">market</div>
-  <input id="stk" class="box" type="text" placeholder="종목 입력 (예: Tesla, 삼성전자)">
+  <input id="stk" class="box" type="text" placeholder="종목 입력 (예: 삼성전자)">
 </div>
 
 <button id="go">실행</button>
@@ -41,14 +42,15 @@ pre{white-space:pre-wrap;background:#1b1b1b;padding:12px;border-radius:8px;font-
 <pre id="out"></pre>
 
 <script>
-let TG_TOKEN = "", TG_CHAT = "";
-const HOURS = 18, TOP_N = 10, MAX_ARTICLES = 350;
+const HOURS = 18, TOP_N = 10, KW_N = 50, MAX_ARTICLES = 400;
 const MODEL = "claude-sonnet-4-6";
 
-const QUERIES = ["stock market","Wall Street stocks","S&P 500 Nasdaq Dow","stocks rally","stocks selloff",
-"Fed interest rate","inflation CPI","earnings guidance shares","oil prices","tariffs trade war",
-"China economy stocks","Nvidia semiconductor stocks","Treasury yields dollar","Asia markets Nikkei KOSPI",
-"Europe markets STOXX","geopolitical risk markets"];
+// ---- 검색어 (한글) ----
+const MARKET_RSS = ["속보 증시","특징주","코스피 코스닥 마감","환율 금리","반도체","미국 시장","미국 금리","이슈 증시"];
+const MARKET_GDELT = ["(코스피 OR 코스닥 OR 증시) 속보 sourcelang:korean",
+  "특징주 (급등 OR 급락) sourcelang:korean",
+  "(삼성전자 OR SK하이닉스 OR 현대차 OR 네이버) 주가 sourcelang:korean"];
+const MARKET_YT = ["증시 속보","주식 특징주","코스피 오늘"];
 
 const PROXIES = [
   u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
@@ -57,259 +59,343 @@ const PROXIES = [
   u => "https://thingproxy.freeboard.io/fetch/" + u
 ];
 
-const BULL = ["rally","surge","soar","jump","gain","record high","beat","beats","upgrade","rate cut","cuts rates","easing","stimulus","deal","truce","ceasefire","rebound","optimism","strong earnings","boost","climb","rise","rises"];
-const BEAR = ["plunge","tumble","slump","selloff","sell-off","drop","falls","fall","crash","fear","recession","downgrade","miss","misses","tariff","war","attack","inflation","hike","layoff","default","warning","probe","ban","sanction","losses","slide","worry","concern"];
-BULL.push("급등","상승","호실적","신고가","수주","흑자","반등","강세","돌파","호재");
-BEAR.push("급락","하락","적자","부진","리콜","소송","약세","우려","악재","제재","조사","감원");
-const STOP = new Set("the and for with from that this after over into amid about will could would stock stocks market markets shares says said more than what how new news today week".split(" "));
+const BULL = ["급등","상승","호실적","신고가","수주","흑자","반등","강세","돌파","호재","개선","증가","승인","상향","인수","최고"];
+const BEAR = ["급락","하락","적자","부진","리콜","소송","약세","우려","악재","제재","조사","감원","폭락","위기","둔화","하향","경고","충격","파산","논란"];
+const STOP = new Set("오늘 속보 특징주 전망 마감 상승 하락 급등 급락 관련 이후 대한 위해 통해 최근 올해 내년 지난 이번 시장 증시 주가 코스피 코스닥 종목 투자 투자자 기업 한국 미국 전날 현재 가운데 영향 발표 예상 결과 시간 가능성 이상 이하 규모 포인트 억원 조원 달러 기준 대비 증권 뉴스 영상 라이브 주식 실시간 분석 정리 총정리 오전 오후 장중".split(" "));
 
 const $ = id => document.getElementById(id);
 const log = m => { $("log").textContent += m + "\n"; };
-try {
-  $("key").value = localStorage.getItem("gao_key") || "";
-  $("tok").value = localStorage.getItem("gao_tok") || "";
-  $("chat").value = localStorage.getItem("gao_chat") || "";
-} catch(e){}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clean = t => t.replace(/\s+/g, " ").trim();
+const keyOf = t => t.toLowerCase().replace(/[^a-z0-9가-힣]/g, "").slice(0, 60);
+const cutoff = () => Date.now() - HOURS * 3600 * 1000;
+const decode = s => { const d = document.createElement("textarea"); d.innerHTML = s; return d.value; };
+const fmt = v => v >= 10000 ? (v / 10000).toFixed(1) + "만" : String(v);
 
+// ---- 저장된 입력값 ----
+const FIELDS = {tok:"gao_tok", chat:"gao_chat", key:"gao_key", yt:"gao_yt"};
+try { for (const [id, k] of Object.entries(FIELDS)) $(id).value = localStorage.getItem(k) || ""; } catch(e){}
+
+// ---- 모드 선택 ----
 let mode = "market";
-function setMode(m){
-  mode = m;
-  $("mk").classList.toggle("on", m==="market");
-  $("stk").classList.toggle("on", m==="stock");
-}
-$("mk").onclick = ()=>{ setMode("market"); $("stk").blur(); };
-$("stk").addEventListener("focus", ()=>setMode("stock"));
-$("stk").addEventListener("input", ()=>setMode("stock"));
+function setMode(m){ mode = m; $("mk").classList.toggle("on", m==="market"); $("stk").classList.toggle("on", m==="stock"); }
+$("mk").onclick = () => { setMode("market"); $("stk").blur(); };
+$("stk").addEventListener("focus", () => setMode("stock"));
+$("stk").addEventListener("input", () => setMode("stock"));
 
+// ---- 수집 1: 구글 뉴스 (한글 RSS) ----
 async function getXml(url){
   for (const p of PROXIES){
     try{
       const r = await fetch(p(url));
       if(!r.ok) continue;
       const t = await r.text();
-      if(t.includes("<item")) return new DOMParser().parseFromString(t,"text/xml");
+      if(t.includes("<item")) return new DOMParser().parseFromString(t, "text/xml");
     }catch(e){}
   }
   return null;
 }
-
-async function collectRss(qs, ko){
-  const cutoff = Date.now() - HOURS*3600*1000;
-  const seen = new Set(), arts = [];
-  let done = 0;
-  await Promise.all(qs.map(async q=>{
-    const url = "https://news.google.com/rss/search?q="+encodeURIComponent(q+" when:1d")+"" + (ko ? "&hl=ko&gl=KR&ceid=KR:ko" : "&hl=en-US&gl=US&ceid=US:en");
-    const xml = await getXml(url);
-    done++; log(`수집 ${done}/${qs.length}`);
-    if(!xml) return;
-    xml.querySelectorAll("item").forEach(it=>{
-      const pub = new Date(it.querySelector("pubDate")?.textContent||"").getTime();
-      if(!pub || pub < cutoff) return;
-      let title = (it.querySelector("title")?.textContent||"").replace(/\s+/g," ").trim();
-      let source = it.querySelector("source")?.textContent || "";
-      if(!source && title.includes(" - ")){ const i=title.lastIndexOf(" - "); source=title.slice(i+3); title=title.slice(0,i); }
-      else if(title.endsWith(" - "+source)) title = title.slice(0,-(source.length+3));
-      const key = title.toLowerCase().replace(/[^a-z0-9가-힣]/g,"").slice(0,80);
-      if(!key || seen.has(key)) return;
-      seen.add(key);
-      arts.push({title, source: source||"unknown", pub});
-    });
-  }));
-  arts.sort((a,b)=>b.pub-a.pub);
-  return arts.slice(0,MAX_ARTICLES);
+async function fromGoogleNews(qs){
+  const out = [];
+  for(let i=0; i<qs.length; i+=3){
+    await Promise.all(qs.slice(i, i+3).map(async q=>{
+      const xml = await getXml("https://news.google.com/rss/search?q="+encodeURIComponent(q+" when:1d")+"&hl=ko&gl=KR&ceid=KR:ko");
+      if(!xml) return;
+      xml.querySelectorAll("item").forEach(it=>{
+        const pub = new Date(it.querySelector("pubDate")?.textContent || "").getTime();
+        if(!pub || pub < cutoff()) return;
+        let title = clean(it.querySelector("title")?.textContent || "");
+        let source = it.querySelector("source")?.textContent || "";
+        const k = title.lastIndexOf(" - ");
+        if(k > 0){ if(!source) source = title.slice(k+3); title = title.slice(0, k); }
+        out.push({title, source: source || "구글뉴스", pub, views: 0});
+      });
+    }));
+    log(`구글 뉴스 ${Math.min(i+3, qs.length)}/${qs.length}`);
+  }
+  return out;
 }
 
-// ---------- GDELT (프록시 없이 직접 호출) ----------
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
-async function collectGdelt(gq){
-  const seen = new Set(), arts = [];
-  for(let i=0;i<gq.length;i++){
-    log(`뉴스 수집 ${i+1}/${gq.length}`);
+// ---- 수집 2: GDELT 한국어 뉴스 (프록시 없이) ----
+async function fromGdelt(gq){
+  const out = [];
+  for(let i=0; i<gq.length; i++){
     try{
       const url = "https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent(gq[i])
         +"&mode=artlist&maxrecords=250&format=json&sort=datedesc&timespan="+HOURS+"h";
-      const r = await fetch(url);
-      const t = await r.text();
+      const t = await (await fetch(url)).text();
       let j = null; try{ j = JSON.parse(t); }catch(e){}
       (j && j.articles || []).forEach(a=>{
         const m = (a.seendate||"").match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
         const pub = m ? Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6]) : Date.now();
-        const title = (a.title||"").replace(/\s+/g," ").trim();
-        const key = title.toLowerCase().replace(/[^a-z0-9가-힣]/g,"").slice(0,80);
-        if(!key || seen.has(key)) return;
-        seen.add(key);
-        arts.push({title, source: a.domain||"unknown", pub});
+        out.push({title: clean(a.title||""), source: a.domain || "unknown", pub, views: 0});
       });
-    }catch(e){ log("  (이번 검색 실패, 다음으로)"); }
-    if(i<gq.length-1) await sleep(5500);
+    }catch(e){}
+    if(i < gq.length-1) await sleep(5500);
   }
-  arts.sort((a,b)=>b.pub-a.pub);
-  return arts.slice(0,MAX_ARTICLES);
+  log(`한국어 뉴스(GDELT) ${out.length}건`);
+  return out;
 }
 
-async function collect(qs, ko, focus){
-  let gq;
-  if(focus){
-    gq = ko ? [`"${focus}" sourcelang:korean`, `"${focus}" 주가 sourcelang:korean`]
-            : [`"${focus}" sourcelang:english`, `"${focus}" (stock OR shares) sourcelang:english`];
-  } else {
-    gq = ['"stock market" sourcelang:english',
-          '(stocks OR shares) (rally OR surge OR record) sourcelang:english',
-          '(stocks OR shares) (plunge OR selloff OR slump) sourcelang:english',
-          '(Fed OR inflation OR tariffs OR earnings) (markets OR stocks) sourcelang:english'];
+// ---- 수집 3: 유튜브 (API 키 있을 때, 조회수 포함) ----
+async function fromYouTube(qs, key){
+  const meta = {}, ids = [];
+  const after = new Date(cutoff()).toISOString();
+  for(const q of qs){
+    try{
+      const u = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=25&order=viewCount"
+        +"&regionCode=KR&relevanceLanguage=ko&publishedAfter="+encodeURIComponent(after)
+        +"&q="+encodeURIComponent(q)+"&key="+key;
+      const j = await (await fetch(u)).json();
+      if(j.error){ log("YouTube 오류: "+j.error.message); break; }
+      (j.items||[]).forEach(v=>{
+        const id = v.id.videoId;
+        if(meta[id]) return;
+        meta[id] = {title: clean(decode(v.snippet.title)), source: "YouTube·"+decode(v.snippet.channelTitle),
+                    pub: new Date(v.snippet.publishedAt).getTime(), views: 0};
+        ids.push(id);
+      });
+    }catch(e){}
   }
-  let arts = await collectGdelt(gq);
-  if(!arts.length){
-    log("다른 경로로 재시도 중...");
-    arts = await collectRss(qs, ko);
+  for(let i=0; i<ids.length; i+=50){
+    try{
+      const j = await (await fetch("https://www.googleapis.com/youtube/v3/videos?part=statistics&id="+ids.slice(i,i+50).join(",")+"&key="+key)).json();
+      (j.items||[]).forEach(v=>{ meta[v.id].views = +(v.statistics.viewCount||0); });
+    }catch(e){}
   }
-  return arts;
+  log(`유튜브 영상 ${ids.length}건`);
+  return ids.map(id=>meta[id]);
 }
 
-// ---------- Claude 방식 ----------
+async function collect(focus){
+  const ytKey = $("yt").value.trim();
+  log("한글 뉴스 검색 중... (1~2분)");
+  const lists = await Promise.all([
+    fromGoogleNews(focus ? [focus, focus+" 주가", focus+" 속보"] : MARKET_RSS).catch(()=>[]),
+    fromGdelt(focus ? [`"${focus}" sourcelang:korean`] : MARKET_GDELT).catch(()=>[]),
+    ytKey ? fromYouTube(focus ? [focus+" 주가"] : MARKET_YT, ytKey).catch(()=>[]) : Promise.resolve([])
+  ]);
+  const seen = new Set(), arts = [];
+  lists.flat().forEach(a=>{
+    const k = keyOf(a.title);
+    if(!k || seen.has(k) || a.pub < cutoff()) return;
+    seen.add(k); arts.push(a);
+  });
+  arts.sort((a,b)=>b.pub - a.pub);
+  return arts.slice(0, MAX_ARTICLES);
+}
+
+// ---- 분석 1: Claude (한글 요약 + 키워드) ----
 async function analyzeClaude(arts, apiKey, focus){
-  const lines = arts.map((a,i)=>`${i}|${a.source}|${a.title}`).join("\n");
-  const prompt = `아래는 최근 ${HOURS}시간 ${focus?`'${focus}' 관련`:"글로벌"} 뉴스 헤드라인입니다 (형식: 번호|매체|제목).
-1. 같은 사건/주제 기사를 하나의 '이슈'로 묶으세요.
-2. ${focus?`'${focus}'의 주가/사업에`:"글로벌 증시에"} 호재(bullish)/악재(bearish)로 분류하고, 무관하거나 불분명하면 제외하세요.
+  const lines = arts.map((a,i)=>`${i}|${a.source}|${a.title}${a.views ? "|조회수 "+a.views : ""}`).join("\n");
+  const prompt = `아래는 최근 ${HOURS}시간 ${focus ? `'${focus}' 관련 ` : ""}한국 뉴스·유튜브 헤드라인입니다 (형식: 번호|매체|제목|조회수).
+1. 같은 사건/주제를 다루는 항목들을 하나의 '이슈'로 묶으세요.
+2. ${focus ? `'${focus}'의 주가/사업에` : "국내외 증시에"} 호재(bullish)/악재(bearish)로 분류하고, 무관하거나 불분명하면 제외하세요.
 3. 이슈마다 한국어 요약을 쓰세요 (60자 내외, 무슨 일인지 + 증시에 왜 영향인지, 관련 종목/지수/섹터 포함).
-4. 이슈에 속한 기사 번호 전부를 ids에 넣으세요.
+4. 이슈에 속한 항목 번호 전부를 ids에 넣으세요.
 5. 전체 흐름을 한국어 2문장으로 총평해 summary에 쓰세요.
+6. 헤드라인에서 자주 언급되는 주식 종목명·기업명·핵심 테마 키워드 ${KW_N}개를 언급 많은 순으로 keywords에 넣으세요.
 JSON만 출력 (설명/코드블록 금지):
-{"summary":"총평 2문장","bullish":[{"issue":"요약","ids":[0,5]}],"bearish":[{"issue":"요약","ids":[2,9]}]}
+{"summary":"총평 2문장","bullish":[{"issue":"요약","ids":[0,5]}],"bearish":[{"issue":"요약","ids":[2,9]}],"keywords":["삼성전자","SK하이닉스","..."]}
 
 헤드라인:
 ${lines}`;
-  const r = await fetch("https://api.anthropic.com/v1/messages",{
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST",
     headers:{"x-api-key":apiKey,"anthropic-version":"2023-06-01","content-type":"application/json",
              "anthropic-dangerous-direct-browser-access":"true"},
-    body:JSON.stringify({model:MODEL,max_tokens:4000,messages:[{role:"user",content:prompt}]})
+    body: JSON.stringify({model:MODEL, max_tokens:4000, messages:[{role:"user", content:prompt}]})
   });
   if(!r.ok) throw new Error("Claude API 오류 "+r.status);
   const j = await r.json();
-  const txt = j.content.map(b=>b.text||"").join("").replace(/```json|```/g,"").trim();
-  return JSON.parse(txt);
+  return JSON.parse(j.content.map(b=>b.text||"").join("").replace(/```json|```/g,"").trim());
 }
 
-// ---------- 키워드 방식 ----------
+// ---- 분석 2: 키워드 방식 (API 키 없을 때) ----
 function tokens(t){
-  return new Set(t.toLowerCase().replace(/[^a-z0-9가-힣 ]/g," ").split(/\s+/).filter(w=>(w.length>3 || (/[가-힣]/.test(w) && w.length>=2)) && !STOP.has(w)));
+  return new Set(t.replace(/[^가-힣A-Za-z0-9 ]/g," ").split(/\s+/).filter(w=>w.length>=2 && !STOP.has(w)));
 }
-function jacc(a,b){
-  let inter=0; a.forEach(x=>{ if(b.has(x)) inter++; });
-  const uni = a.size + b.size - inter;
-  return uni ? inter/uni : 0;
-}
+function jacc(a,b){ let n=0; a.forEach(x=>{ if(b.has(x)) n++; }); const u=a.size+b.size-n; return u ? n/u : 0; }
 function analyzeKeyword(arts){
   const clusters = [];
   arts.forEach((a,i)=>{
     const tk = tokens(a.title);
-    let best=null, bs=0;
-    for(const c of clusters){ const s=jacc(tk,c.tk); if(s>bs){bs=s;best=c;} }
-    if(best && bs>=0.3){ best.ids.push(i); tk.forEach(x=>best.tk.add(x)); }
+    let best = null, bs = 0;
+    for(const c of clusters){ const s = jacc(tk, c.tk); if(s > bs){ bs = s; best = c; } }
+    if(best && bs >= 0.3){ best.ids.push(i); tk.forEach(x=>best.tk.add(x)); }
     else clusters.push({tk, ids:[i]});
   });
-  const res = {bullish:[], bearish:[]};
+  const res = {bullish:[], bearish:[], keywords:null};
   clusters.forEach(c=>{
-    let b=0, r=0;
-    c.ids.forEach(i=>{
-      const t = arts[i].title.toLowerCase();
-      BULL.forEach(k=>{ if(t.includes(k)) b++; });
-      BEAR.forEach(k=>{ if(t.includes(k)) r++; });
-    });
-    if(b===r) return;
-    (b>r ? res.bullish : res.bearish).push({issue: arts[c.ids[0]].title, ids:c.ids});
+    let b = 0, r = 0;
+    c.ids.forEach(i=>{ const t = arts[i].title; BULL.forEach(k=>{ if(t.includes(k)) b++; }); BEAR.forEach(k=>{ if(t.includes(k)) r++; }); });
+    if(b === r) return;
+    (b > r ? res.bullish : res.bearish).push({issue: arts[c.ids[0]].title, ids: c.ids});
   });
   return res;
 }
 
+// ---- 랭킹 / 키워드 집계 ----
 function rank(items, arts){
   const out = [];
   items.forEach(it=>{
     const ids = [...new Set(it.ids||[])].filter(i=>i>=0 && i<arts.length);
     if(!ids.length) return;
     const src = new Set(ids.map(i=>arts[i].source));
-    out.push({issue:it.issue, count:ids.length, sources:src.size, score:ids.length+src.size*1.5});
+    const views = ids.reduce((s,i)=>s+arts[i].views, 0);
+    out.push({issue: it.issue, count: ids.length, sources: src.size, views,
+              score: ids.length + src.size*1.5 + Math.log10(1+views)});
   });
-  return out.sort((a,b)=>b.score-a.score).slice(0,TOP_N);
+  return out.sort((a,b)=>b.score-a.score).slice(0, TOP_N);
+}
+function keywordsByFreq(arts){
+  const m = {};
+  arts.forEach(a=>{
+    const seen = new Set();
+    a.title.replace(/[^가-힣A-Za-z0-9 ]/g," ").split(/\s+/).forEach(w=>{
+      if(w.length >= 3) w = w.replace(/(은|는|이|가|을|를|의|에|도|로|와|과|에서|으로)$/, "");
+      if(w.length < 2 || STOP.has(w) || /^\d+$/.test(w)) return;
+      seen.add(w);
+    });
+    seen.forEach(w=>{ m[w] = (m[w]||0) + 1; });
+  });
+  return Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0, KW_N).map(([word,count])=>({word, count}));
+}
+function countKeywords(list, arts){
+  return list.map(w=>({word: w, count: arts.filter(a=>a.title.toLowerCase().includes(String(w).toLowerCase())).length}))
+    .filter(k=>k.count > 0).sort((a,b)=>b.count - a.count).slice(0, KW_N);
 }
 
-async function toKo(text){
-  if(/[가-힣]/.test(text)) return text;
-  try{
-    const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t&q="+encodeURIComponent(text);
-    const r = await fetch(url);
-    const j = await r.json();
-    const out = (j[0]||[]).map(x=>x[0]).join("").trim();
-    return out || text;
-  }catch(e){ return text; }
-}
-async function translateAll(list){
-  await Promise.all(list.map(async r=>{ r.issue = await toKo(r.issue); }));
-}
-
+// ---- 메시지 ----
 function section(title, list){
-  let s = title+"\n";
-  for(let n=0;n<TOP_N;n++){
+  let s = title + "\n";
+  for(let n=0; n<TOP_N; n++){
     const r = list[n];
-    s += r ? `${n+1}. ${r.issue} (기사 ${r.count}건·${r.sources}개 매체)\n` : `${n+1}. -\n`;
+    s += r ? `${n+1}. ${r.issue} (${r.count}건·${r.sources}곳${r.views ? "·조회 "+fmt(r.views) : ""})\n` : `${n+1}. -\n`;
   }
   return s;
 }
-
-async function sendTG(text){
-  const chunks=[]; let cur="";
-  text.split("\n").forEach(l=>{ if(cur.length+l.length+1>3800){chunks.push(cur);cur="";} cur+=l+"\n"; });
+function kwSection(list){
+  let s = `👉핫 키워드 TOP${KW_N} (주식·기업)\n`;
+  list.forEach((k, n)=>{ s += `${n+1}. ${k.word} (${k.count}건)\n`; });
+  return s;
+}
+async function sendTG(token, chat, text){
+  const chunks = []; let cur = "";
+  text.split("\n").forEach(l=>{ if(cur.length + l.length + 1 > 3800){ chunks.push(cur); cur = ""; } cur += l + "\n"; });
   if(cur) chunks.push(cur);
   for(const c of chunks){
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method:"POST", headers:{"content-type":"application/json"},
-      body:JSON.stringify({chat_id:TG_CHAT, text:c})
+      body: JSON.stringify({chat_id: chat, text: c})
     });
-    if(!r.ok) throw new Error("텔레그램 전송 실패 "+r.status+" (봇에게 /start 보냈는지 확인)");
+    if(!r.ok) throw new Error("텔레그램 전송 실패 "+r.status+" (봇에게 /start 보냈는지, 토큰·채팅ID 확인)");
   }
 }
 
+// ---- 시장 시세 (Yahoo Finance, 가장 최근 값) ----
+const SYMS = ["^DJI","^IXIC","^GSPC","^NDX","^RUT","^VIX","KRW=X","JPY=X","CNY=X","EURUSD=X","^TNX","^TYX","GC=F","SI=F","HG=F","CL=F","BZ=F","NG=F"];
+async function getJson(url){
+  try{ const r = await fetch(url); if(r.ok) return await r.json(); }catch(e){}
+  for(const p of PROXIES){
+    try{ const r = await fetch(p(url)); if(!r.ok) continue; return JSON.parse(await r.text()); }catch(e){}
+  }
+  return null;
+}
+async function quote(sym){
+  const j = await getJson("https://query1.finance.yahoo.com/v8/finance/chart/"+encodeURIComponent(sym)+"?range=1d&interval=1d");
+  const m = j && j.chart && j.chart.result && j.chart.result[0] && j.chart.result[0].meta;
+  if(!m || m.regularMarketPrice == null) return null;
+  return {price: m.regularMarketPrice, prev: (m.previousClose != null ? m.previousClose : m.chartPreviousClose), time: m.regularMarketTime};
+}
+const ratio = (a, b, k) => (a && b) ? {price: k*a.price/b.price, prev: (a.prev && b.prev) ? k*a.prev/b.prev : null, time: Math.min(a.time, b.time)} : null;
+const num = (v, d) => v.toLocaleString("en-US", {minimumFractionDigits: d, maximumFractionDigits: d});
+function kst(t){
+  if(!t) return "시각 미상";
+  const p = {};
+  new Intl.DateTimeFormat("ko-KR", {timeZone:"Asia/Seoul", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false})
+    .formatToParts(new Date(t*1000)).forEach(x=>{ p[x.type] = x.value; });
+  return `${p.month}/${p.day} ${p.hour}:${p.minute}`;
+}
+function line(name, q, d, pct, unit){
+  if(!q) return `${name} 조회 실패`;
+  const chg = q.prev != null ? q.price - q.prev : null;
+  let s = `${name} ${num(q.price, d)}${unit||""}`;
+  if(chg != null){
+    s += ` ${chg > 0 ? "▲" : chg < 0 ? "▼" : "–"}${num(Math.abs(chg), d)}`;
+    if(pct && q.prev) s += ` (${chg >= 0 ? "+" : "-"}${Math.abs(chg/q.prev*100).toFixed(2)}%)`;
+  }
+  return s + ` · ${kst(q.time)}`;
+}
+async function marketBlock(){
+  const q = {};
+  for(let i=0; i<SYMS.length; i+=6){
+    await Promise.all(SYMS.slice(i, i+6).map(async s=>{ q[s] = await quote(s); }));
+  }
+  if(!SYMS.some(s=>q[s])) return "";
+  const KRW = q["KRW=X"], JPY = q["JPY=X"], CNY = q["CNY=X"];
+  return [
+    "🇺🇸 지수 (시각: KST)",
+    line("Dow", q["^DJI"], 2, true), line("Nasdaq", q["^IXIC"], 2, true), line("S&P 500", q["^GSPC"], 2, true),
+    line("US Tech(나스닥100)", q["^NDX"], 2, true), line("Russell", q["^RUT"], 2, true), line("VIX", q["^VIX"], 2, true),
+    "",
+    "💲환율",
+    line("원/달러", KRW, 2, true), line("원/엔(100엔)", ratio(KRW, JPY, 100), 2, true), line("원/위안", ratio(KRW, CNY, 1), 2, true),
+    line("엔/달러", JPY, 2, true), line("유로/달러", q["EURUSD=X"], 4, true),
+    "",
+    "💵 금리",
+    line("미국 10년물 국채금리", q["^TNX"], 3, false, "%"), line("미국 30년물 국채금리", q["^TYX"], 3, false, "%"),
+    "",
+    "🛢️Commodity",
+    line("금", q["GC=F"], 2, true), line("은", q["SI=F"], 2, true), line("구리", q["HG=F"], 3, true),
+    line("WTI", q["CL=F"], 2, true), line("BRENT", q["BZ=F"], 2, true), line("천연가스", q["NG=F"], 3, true),
+    ""
+  ].join("\n");
+}
+
+// ---- 실행 ----
 $("go").onclick = async ()=>{
-  const btn=$("go"); btn.disabled=true; $("log").textContent=""; $("out").textContent="";
+  const btn = $("go"); btn.disabled = true; $("log").textContent = ""; $("out").textContent = "";
   try{
-    const key = $("key").value.trim();
-    TG_TOKEN = $("tok").value.trim(); TG_CHAT = $("chat").value.trim();
-    if(!TG_TOKEN || !TG_CHAT) throw new Error("봇 토큰과 채팅 ID를 입력해주세요.");
-    try{ localStorage.setItem("gao_key", key); localStorage.setItem("gao_tok", TG_TOKEN); localStorage.setItem("gao_chat", TG_CHAT); }catch(e){}
-    log("뉴스 수집 중...");
-    let focus = "", arts;
-    if(mode==="stock"){
-      focus = $("stk").value.trim();
+    const v = id => $(id).value.trim();
+    if(!v("tok") || !v("chat")) throw new Error("봇 토큰과 채팅 ID를 입력해주세요.");
+    try{ for(const [id, k] of Object.entries(FIELDS)) localStorage.setItem(k, v(id)); }catch(e){}
+
+    let focus = "";
+    if(mode === "stock"){
+      focus = v("stk");
       if(!focus) throw new Error("종목/키워드를 입력하거나 market을 선택해주세요.");
-      const ko = /[가-힣]/.test(focus);
-      const qs = ko ? [focus, focus+" 주가", focus+" 실적"] : [focus, focus+" stock", focus+" shares", focus+" earnings"];
-      arts = await collect(qs, ko, focus);
-    } else {
-      arts = await collect(QUERIES, false, "");
     }
-    log(`기사 ${arts.length}건 수집`);
+
+    const mktP = focus ? Promise.resolve("") : marketBlock().catch(()=>"");
+    const arts = await collect(focus);
+    log(`총 ${arts.length}건 수집`);
     if(!arts.length) throw new Error("뉴스를 가져오지 못했어요. 잠시 후 다시 시도해주세요.");
 
     let res;
-    if(key){ log("Claude로 이슈 분류 중..."); res = await analyzeClaude(arts,key,focus); }
-    else { log("⚠️ API 키가 없어 번역만 합니다. 키를 넣으면 한글 요약까지 돼요."); res = analyzeKeyword(arts); }
+    if(v("key")){ log("Claude로 한글 요약 중..."); res = await analyzeClaude(arts, v("key"), focus); }
+    else { log("⚠️ Anthropic API 키가 없어 요약 없이 키워드 방식으로 정리해요."); res = analyzeKeyword(arts); }
 
-    const bull = rank(res.bullish||[],arts), bear = rank(res.bearish||[],arts);
-    log("한글로 번역 중...");
-    await translateAll([...bull, ...bear]);
+    const bull = rank(res.bullish || [], arts), bear = rank(res.bearish || [], arts);
+    const kws = res.keywords ? countKeywords(res.keywords, arts) : keywordsByFreq(arts);
+    const mkt = await mktP;
     const now = new Date().toLocaleString("ko-KR");
-    const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus?`[${focus}]\n`:""}(${now} 기준 최근 ${HOURS}시간)\n\n${res.summary?`📝 ${res.summary}\n\n`:""}`
-              + section(focus?`ㅡ${focus} 호재`:"ㅡ증시 호재",bull) + "\n" + section(focus?`ㅡ${focus} 악재`:"ㅡ증시 악재",bear);
+
+    const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus ? `[${focus}]\n` : ""}(${now} 기준 최근 ${HOURS}시간)\n\n`
+      + (res.summary ? `📝 ${res.summary}\n\n` : "")
+      + (mkt ? mkt + "\n" : "")
+      + section(focus ? `🔺${focus} 호재` : "🔺증시 호재", bull) + "\n"
+      + section(focus ? `🔻${focus} 악재` : "🔻증시 악재", bear) + "\n"
+      + kwSection(kws);
     $("out").textContent = msg;
+
     log("텔레그램 전송 중...");
-    await sendTG(msg);
+    await sendTG(v("tok"), v("chat"), msg);
     log("✅ 완료! 텔레그램을 확인하세요.");
   }catch(e){
-    log("❌ "+e.message);
+    log("❌ " + e.message);
   }
-  btn.disabled=false;
+  btn.disabled = false;
 };
 </script>
 </body>
