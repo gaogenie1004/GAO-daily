@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GAO daily</title>
+<style>
+body{font-family:-apple-system,"Malgun Gothic",sans-serif;margin:0;padding:20px;background:#111;color:#eee}
+h1{font-size:31pt;margin:0 0 16px;padding:28px 14px;background:#e53935;color:#fff;text-align:center;border-radius:10px}
+button{width:100%;padding:18px;font-size:18px;font-weight:700;border:0;border-radius:12px;background:#0d47a1;color:#fff}
+button:disabled{background:#555}
+input{width:100%;box-sizing:border-box;padding:10px;margin:6px 0 14px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;font-size:14px}
+label{font-size:13px;color:#aaa}
+#modes{display:flex;gap:10px;margin:6px 0 14px}
+#modes .box{flex:1;min-width:0;box-sizing:border-box;margin:0;width:auto;padding:14px;border-radius:10px;border:2px solid #444;background:#222;color:#eee;font-size:16px;text-align:center}
+#modes .box.on{border-color:#4fc3f7;background:#1e3a52}
+#mk{display:flex;align-items:center;justify-content:center;font-weight:700}
+pre{white-space:pre-wrap;background:#1b1b1b;padding:12px;border-radius:8px;font-size:13px;line-height:1.5}
+#log{color:#9ad}
+</style>
+</head>
+<body>
+<h1>🔴 GAO daily 🔴</h1>
+
+<label>텔레그램 봇 토큰</label>
+<input id="tok" type="password" placeholder="123456789:AAH...">
+<label>텔레그램 채팅 ID</label>
+<input id="chat" type="text" inputmode="numeric" placeholder="54529109">
+
+<label>Anthropic API 키 (선택 · 넣으면 한국어 요약/정확도 ↑, 비우면 키워드 방식)</label>
+<input id="key" type="password" placeholder="sk-ant-...">
+
+<label>분석 대상 선택 (market = 전체 증시 / 오른쪽 = 종목·키워드)</label>
+<div id="modes">
+  <div id="mk" class="box on">market</div>
+  <input id="stk" class="box" type="text" placeholder="종목 입력 (예: Tesla, 삼성전자)">
+</div>
+
+<button id="go">실행</button>
+<pre id="log"></pre>
+<pre id="out"></pre>
+
+<script>
+let TG_TOKEN = "", TG_CHAT = "";
+const HOURS = 18, TOP_N = 10, MAX_ARTICLES = 350;
+const MODEL = "claude-sonnet-4-6";
+
+const QUERIES = ["stock market","Wall Street stocks","S&P 500 Nasdaq Dow","stocks rally","stocks selloff",
+"Fed interest rate","inflation CPI","earnings guidance shares","oil prices","tariffs trade war",
+"China economy stocks","Nvidia semiconductor stocks","Treasury yields dollar","Asia markets Nikkei KOSPI",
+"Europe markets STOXX","geopolitical risk markets"];
+
+const PROXIES = [
+  u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  u => "https://corsproxy.io/?" + encodeURIComponent(u)
+];
+
+const BULL = ["rally","surge","soar","jump","gain","record high","beat","beats","upgrade","rate cut","cuts rates","easing","stimulus","deal","truce","ceasefire","rebound","optimism","strong earnings","boost","climb","rise","rises"];
+const BEAR = ["plunge","tumble","slump","selloff","sell-off","drop","falls","fall","crash","fear","recession","downgrade","miss","misses","tariff","war","attack","inflation","hike","layoff","default","warning","probe","ban","sanction","losses","slide","worry","concern"];
+BULL.push("급등","상승","호실적","신고가","수주","흑자","반등","강세","돌파","호재");
+BEAR.push("급락","하락","적자","부진","리콜","소송","약세","우려","악재","제재","조사","감원");
+const STOP = new Set("the and for with from that this after over into amid about will could would stock stocks market markets shares says said more than what how new news today week".split(" "));
+
+const $ = id => document.getElementById(id);
+const log = m => { $("log").textContent += m + "\n"; };
+try {
+  $("key").value = localStorage.getItem("gao_key") || "";
+  $("tok").value = localStorage.getItem("gao_tok") || "";
+  $("chat").value = localStorage.getItem("gao_chat") || "";
+} catch(e){}
+
+let mode = "market";
+function setMode(m){
+  mode = m;
+  $("mk").classList.toggle("on", m==="market");
+  $("stk").classList.toggle("on", m==="stock");
+}
+$("mk").onclick = ()=>{ setMode("market"); $("stk").blur(); };
+$("stk").addEventListener("focus", ()=>setMode("stock"));
+$("stk").addEventListener("input", ()=>setMode("stock"));
+
+async function getXml(url){
+  for (const p of PROXIES){
+    try{
+      const r = await fetch(p(url));
+      if(!r.ok) continue;
+      const t = await r.text();
+      if(t.includes("<item")) return new DOMParser().parseFromString(t,"text/xml");
+    }catch(e){}
+  }
+  return null;
+}
+
+async function collect(qs, ko){
+  const cutoff = Date.now() - HOURS*3600*1000;
+  const seen = new Set(), arts = [];
+  let done = 0;
+  await Promise.all(qs.map(async q=>{
+    const url = "https://news.google.com/rss/search?q="+encodeURIComponent(q+" when:1d")+"" + (ko ? "&hl=ko&gl=KR&ceid=KR:ko" : "&hl=en-US&gl=US&ceid=US:en");
+    const xml = await getXml(url);
+    done++; log(`수집 ${done}/${qs.length}`);
+    if(!xml) return;
+    xml.querySelectorAll("item").forEach(it=>{
+      const pub = new Date(it.querySelector("pubDate")?.textContent||"").getTime();
+      if(!pub || pub < cutoff) return;
+      let title = (it.querySelector("title")?.textContent||"").replace(/\s+/g," ").trim();
+      let source = it.querySelector("source")?.textContent || "";
+      if(!source && title.includes(" - ")){ const i=title.lastIndexOf(" - "); source=title.slice(i+3); title=title.slice(0,i); }
+      else if(title.endsWith(" - "+source)) title = title.slice(0,-(source.length+3));
+      const key = title.toLowerCase().replace(/[^a-z0-9가-힣]/g,"").slice(0,80);
+      if(!key || seen.has(key)) return;
+      seen.add(key);
+      arts.push({title, source: source||"unknown", pub});
+    });
+  }));
+  arts.sort((a,b)=>b.pub-a.pub);
+  return arts.slice(0,MAX_ARTICLES);
+}
+
+// ---------- Claude 방식 ----------
+async function analyzeClaude(arts, apiKey, focus){
+  const lines = arts.map((a,i)=>`${i}|${a.source}|${a.title}`).join("\n");
+  const prompt = `아래는 최근 ${HOURS}시간 ${focus?`'${focus}' 관련`:"글로벌"} 뉴스 헤드라인입니다 (형식: 번호|매체|제목).
+1. 같은 사건/주제 기사를 하나의 '이슈'로 묶으세요.
+2. ${focus?`'${focus}'의 주가/사업에`:"글로벌 증시에"} 호재(bullish)/악재(bearish)로 분류하고, 무관하거나 불분명하면 제외하세요.
+3. 이슈마다 한국어 한 줄 요약(40자 내외, 관련 종목/지수/섹터 포함)을 쓰세요.
+4. 이슈에 속한 기사 번호 전부를 ids에 넣으세요.
+JSON만 출력 (설명/코드블록 금지):
+{"bullish":[{"issue":"요약","ids":[0,5]}],"bearish":[{"issue":"요약","ids":[2,9]}]}
+
+헤드라인:
+${lines}`;
+  const r = await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"x-api-key":apiKey,"anthropic-version":"2023-06-01","content-type":"application/json",
+             "anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:MODEL,max_tokens:4000,messages:[{role:"user",content:prompt}]})
+  });
+  if(!r.ok) throw new Error("Claude API 오류 "+r.status);
+  const j = await r.json();
+  const txt = j.content.map(b=>b.text||"").join("").replace(/```json|```/g,"").trim();
+  return JSON.parse(txt);
+}
+
+// ---------- 키워드 방식 ----------
+function tokens(t){
+  return new Set(t.toLowerCase().replace(/[^a-z0-9가-힣 ]/g," ").split(/\s+/).filter(w=>(w.length>3 || (/[가-힣]/.test(w) && w.length>=2)) && !STOP.has(w)));
+}
+function jacc(a,b){
+  let inter=0; a.forEach(x=>{ if(b.has(x)) inter++; });
+  const uni = a.size + b.size - inter;
+  return uni ? inter/uni : 0;
+}
+function analyzeKeyword(arts){
+  const clusters = [];
+  arts.forEach((a,i)=>{
+    const tk = tokens(a.title);
+    let best=null, bs=0;
+    for(const c of clusters){ const s=jacc(tk,c.tk); if(s>bs){bs=s;best=c;} }
+    if(best && bs>=0.3){ best.ids.push(i); tk.forEach(x=>best.tk.add(x)); }
+    else clusters.push({tk, ids:[i]});
+  });
+  const res = {bullish:[], bearish:[]};
+  clusters.forEach(c=>{
+    let b=0, r=0;
+    c.ids.forEach(i=>{
+      const t = arts[i].title.toLowerCase();
+      BULL.forEach(k=>{ if(t.includes(k)) b++; });
+      BEAR.forEach(k=>{ if(t.includes(k)) r++; });
+    });
+    if(b===r) return;
+    (b>r ? res.bullish : res.bearish).push({issue: arts[c.ids[0]].title, ids:c.ids});
+  });
+  return res;
+}
+
+function rank(items, arts){
+  const out = [];
+  items.forEach(it=>{
+    const ids = [...new Set(it.ids||[])].filter(i=>i>=0 && i<arts.length);
+    if(!ids.length) return;
+    const src = new Set(ids.map(i=>arts[i].source));
+    out.push({issue:it.issue, count:ids.length, sources:src.size, score:ids.length+src.size*1.5});
+  });
+  return out.sort((a,b)=>b.score-a.score).slice(0,TOP_N);
+}
+
+function section(title, list){
+  let s = title+"\n";
+  for(let n=0;n<TOP_N;n++){
+    const r = list[n];
+    s += r ? `${n+1}. ${r.issue} (기사 ${r.count}건·${r.sources}개 매체)\n` : `${n+1}. -\n`;
+  }
+  return s;
+}
+
+async function sendTG(text){
+  const chunks=[]; let cur="";
+  text.split("\n").forEach(l=>{ if(cur.length+l.length+1>3800){chunks.push(cur);cur="";} cur+=l+"\n"; });
+  if(cur) chunks.push(cur);
+  for(const c of chunks){
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
+      method:"POST", headers:{"content-type":"application/json"},
+      body:JSON.stringify({chat_id:TG_CHAT, text:c})
+    });
+    if(!r.ok) throw new Error("텔레그램 전송 실패 "+r.status+" (봇에게 /start 보냈는지 확인)");
+  }
+}
+
+$("go").onclick = async ()=>{
+  const btn=$("go"); btn.disabled=true; $("log").textContent=""; $("out").textContent="";
+  try{
+    const key = $("key").value.trim();
+    TG_TOKEN = $("tok").value.trim(); TG_CHAT = $("chat").value.trim();
+    if(!TG_TOKEN || !TG_CHAT) throw new Error("봇 토큰과 채팅 ID를 입력해주세요.");
+    try{ localStorage.setItem("gao_key", key); localStorage.setItem("gao_tok", TG_TOKEN); localStorage.setItem("gao_chat", TG_CHAT); }catch(e){}
+    log("뉴스 수집 중...");
+    let focus = "", arts;
+    if(mode==="stock"){
+      focus = $("stk").value.trim();
+      if(!focus) throw new Error("종목/키워드를 입력하거나 market을 선택해주세요.");
+      const ko = /[가-힣]/.test(focus);
+      const qs = ko ? [focus, focus+" 주가", focus+" 실적"] : [focus, focus+" stock", focus+" shares", focus+" earnings"];
+      arts = await collect(qs, ko);
+    } else {
+      arts = await collect(QUERIES, false);
+    }
+    log(`기사 ${arts.length}건 수집`);
+    if(!arts.length) throw new Error("뉴스를 가져오지 못했어요. 잠시 후 다시 시도해주세요.");
+
+    let res;
+    if(key){ log("Claude로 이슈 분류 중..."); res = await analyzeClaude(arts,key,focus); }
+    else { log("키워드 방식으로 분류 중..."); res = analyzeKeyword(arts); }
+
+    const bull = rank(res.bullish||[],arts), bear = rank(res.bearish||[],arts);
+    const now = new Date().toLocaleString("ko-KR");
+    const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus?`[${focus}]\n`:""}(${now} 기준 최근 ${HOURS}시간)\n\n`
+              + section(focus?`ㅡ${focus} 호재`:"ㅡ증시 호재",bull) + "\n" + section(focus?`ㅡ${focus} 악재`:"ㅡ증시 악재",bear);
+    $("out").textContent = msg;
+    log("텔레그램 전송 중...");
+    await sendTG(msg);
+    log("✅ 완료! 텔레그램을 확인하세요.");
+  }catch(e){
+    log("❌ "+e.message);
+  }
+  btn.disabled=false;
+};
+</script>
+</body>
+</html>
