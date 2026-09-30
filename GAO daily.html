@@ -172,10 +172,11 @@ async function analyzeClaude(arts, apiKey, focus){
   const prompt = `아래는 최근 ${HOURS}시간 ${focus?`'${focus}' 관련`:"글로벌"} 뉴스 헤드라인입니다 (형식: 번호|매체|제목).
 1. 같은 사건/주제 기사를 하나의 '이슈'로 묶으세요.
 2. ${focus?`'${focus}'의 주가/사업에`:"글로벌 증시에"} 호재(bullish)/악재(bearish)로 분류하고, 무관하거나 불분명하면 제외하세요.
-3. 이슈마다 한국어 한 줄 요약(40자 내외, 관련 종목/지수/섹터 포함)을 쓰세요.
+3. 이슈마다 한국어 요약을 쓰세요 (60자 내외, 무슨 일인지 + 증시에 왜 영향인지, 관련 종목/지수/섹터 포함).
 4. 이슈에 속한 기사 번호 전부를 ids에 넣으세요.
+5. 전체 흐름을 한국어 2문장으로 총평해 summary에 쓰세요.
 JSON만 출력 (설명/코드블록 금지):
-{"bullish":[{"issue":"요약","ids":[0,5]}],"bearish":[{"issue":"요약","ids":[2,9]}]}
+{"summary":"총평 2문장","bullish":[{"issue":"요약","ids":[0,5]}],"bearish":[{"issue":"요약","ids":[2,9]}]}
 
 헤드라인:
 ${lines}`;
@@ -293,13 +294,13 @@ $("go").onclick = async ()=>{
 
     let res;
     if(key){ log("Claude로 이슈 분류 중..."); res = await analyzeClaude(arts,key,focus); }
-    else { log("키워드 방식으로 분류 중..."); res = analyzeKeyword(arts); }
+    else { log("⚠️ API 키가 없어 번역만 합니다. 키를 넣으면 한글 요약까지 돼요."); res = analyzeKeyword(arts); }
 
     const bull = rank(res.bullish||[],arts), bear = rank(res.bearish||[],arts);
     log("한글로 번역 중...");
     await translateAll([...bull, ...bear]);
     const now = new Date().toLocaleString("ko-KR");
-    const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus?`[${focus}]\n`:""}(${now} 기준 최근 ${HOURS}시간)\n\n`
+    const msg = `🔴 GAO가 궁금할 이슈 🔴\n${focus?`[${focus}]\n`:""}(${now} 기준 최근 ${HOURS}시간)\n\n${res.summary?`📝 ${res.summary}\n\n`:""}`
               + section(focus?`ㅡ${focus} 호재`:"ㅡ증시 호재",bull) + "\n" + section(focus?`ㅡ${focus} 악재`:"ㅡ증시 악재",bear);
     $("out").textContent = msg;
     log("텔레그램 전송 중...");
