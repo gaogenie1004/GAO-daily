@@ -1,1 +1,1 @@
-# GAO-daily
+# GAO daily
